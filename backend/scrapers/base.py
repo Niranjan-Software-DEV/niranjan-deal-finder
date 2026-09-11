@@ -1,0 +1,123 @@
+"""
+BaseScraper — shared scrape → validate → cache → fallback pipeline.
+
+Subclasses implement only:
+  build_search_url(query) → str
+  parse(html)             → list[dict]
+"""
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+
+import cache as cache_module
+from config import get_settings
+from models import Product, ScrapeStatus, Source, SourceResult
+from utils.http_client import FetchError, ProviderCredentials, fetch_html
+
+logger = logging.getLogger("scraper.base")
+
+
+class BaseScraper(ABC):
+    source: Source
+    render_js: bool = False
+    country_code: str = "in"
+
+    @abstractmethod
+    def build_search_url(self, query: str) -> str: ...
+
+    @abstractmethod
+    def parse(self, html: str) -> list[dict]: ...
+
+    async def search(self, query: str, provider_credentials: ProviderCredentials | None = None) -> SourceResult:
+        cached = cache_module.get(self.source.value, query)
+        if cached and cached.is_fresh:
+            products = self._products_from_cache(cached)
+            if products:
+                logger.debug("%s: fresh cache hit for %s", self.source.value, query[:40])
+                return SourceResult(source=self.source, status=ScrapeStatus.FRESH, products=products)
+
+        try:
+            url = self.build_search_url(query)
+            html = await fetch_html(
+                url,
+                credentials=provider_credentials,
+                render_js=self.render_js,
+                country_code=self.country_code,
+            )
+            raw_items = self.parse(html)
+
+            validated: list[Product] = []
+            rejected = 0
+            for raw in raw_items:
+                try:
+                    validated.append(Product(source=self.source, **raw))
+                except Exception as exc:  # noqa: BLE001
+                    rejected += 1
+                    logger.debug("%s: dropped item: %s", self.source.value, exc)
+
+            if rejected:
+                logger.warning(
+                    "%s: dropped %d/%d items that failed validation",
+                    self.source.value, rejected, len(raw_items),
+                )
+
+            max_products = get_settings().max_products_per_source
+            if len(validated) > max_products:
+                logger.info("%s: limiting %d products to %d", self.source.value, len(validated), max_products)
+                validated = validated[:max_products]
+
+            if not validated:
+                raise FetchError(
+                    f"{self.source.value}: 0 valid products returned "
+                    f"(selectors may be stale — check /api/v1/health)"
+                )
+
+            cache_module.store(
+                self.source.value, query,
+                [p.model_dump(mode="json") for p in validated],
+            )
+            return SourceResult(
+                source=self.source,
+                status=ScrapeStatus.FRESH,
+                products=validated,
+            )
+
+        except FetchError as exc:
+            logger.error("%s: scrape failed: %s", self.source.value, exc)
+            return self._from_cache_or_unavailable(cached, str(exc))
+
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("%s: unexpected error", self.source.value)
+            return self._from_cache_or_unavailable(
+                cached, f"Unexpected error: {type(exc).__name__}"
+            )
+
+    @staticmethod
+    def _products_from_cache(cached: cache_module.CacheEntry) -> list[Product]:
+        products: list[Product] = []
+        max_products = get_settings().max_products_per_source
+        for item in cached.data[:max_products]:
+            try:
+                products.append(Product(**item))
+            except Exception:  # noqa: BLE001
+                continue
+        return products
+
+    def _from_cache_or_unavailable(
+        self, cached: cache_module.CacheEntry | None, error: str
+    ) -> SourceResult:
+        if cached:
+            products = self._products_from_cache(cached)
+            return SourceResult(
+                source=self.source,
+                status=ScrapeStatus.STALE,
+                products=products,
+                error=error,
+            )
+        return SourceResult(
+            source=self.source,
+            status=ScrapeStatus.UNAVAILABLE,
+            products=[],
+            error=error,
+        )
